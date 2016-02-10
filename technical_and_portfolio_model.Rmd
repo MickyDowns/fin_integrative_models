@@ -1,0 +1,2003 @@
+---
+title: "integrated technical and portfolio rules"
+author: "michael downs"
+date: "Aug 16, 2015"
+output: pdf_document
+---
+
+
+## research questions
+
+Patel et al proposed a passive but dynamic 130/30 strategy using simple factors to rank stocks and standard methods for constructing portfolios. Fan et al introduced constraints and proposed dynamic correlation to adjust holdings, improving performance. How can a portfolio manager use these and other algorithmic tools to bridge the gap between long term investment objectives with short term market realities?
+
+This project uses a three-tiered strategy to increasae returns from the randomley selected portfolio of stocks. Tier one is a baseline, long-only, buy-hold portfolio. Tier two begins with the same portfolio, but trades component stocks daily, taking long and short positions as determined by a set of technical rules. Tier three trades component stocks monthly based on portfolio rules that view stock movements relative to the entire market. 
+
+The results suggest that actively managing long portfolios using combinations of short-term, univariate trading strategies and longer term portfolio balancing strategies have the potential to increase total returns. However, work remains effectively link the strategies into a cohesive whole. 
+
+## data sources
+
+The "market" for this project consists of 85 stocks drawn at random from the S\&P 500. Daily adjusted closing prices and volumes were taken from Yahoo Finance on Friday, 8 August, 2015. From that "market", a random subset of 24 stocks is selcted for the "portfolio". Both the "market" and "portfolio" data sets are further divided into three data sets corresponding to "down", "flat" and "up" markets, each of 1 year in duration. The graphic below shows the S\&P 500 the 85-stock equal-weighted "market" price series with "down", "flat" and "up" ranges superimposed.  
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# this code chunk loads the data from yahoo, 
+# partitions it and then selects the 85-stock "market" portfolio.
+
+library(xts)
+library(impute)
+library(fUnitRoots)
+library(urca)
+library(quantmod)
+library(timeDate)
+library(lubridate)
+library(PerformanceAnalytics)
+library(caret)
+library(e1071)
+library(randomForest)
+
+#library(highfrequency)
+#library(TTR)
+#library(tseries)
+#library(mondate)
+#library(MTS)
+#library(timeSeries)
+#library(car)
+
+tickers=read.csv("~/Documents/Pers/Ed/Courses/stats242/homework/tickers.csv")
+tickers=tickers[,1];tickers=as.character(tickers)
+
+set.seed(1234)
+tickers.mkt=sample(tickers,90)
+data.from=as.Date("2007-05-01");data.to=as.Date("2015-08-07")
+
+# get tickers. store in list. 
+data.mkt.all=list()
+
+for(i in 1:length(tickers.mkt)){
+     data.mkt.all[[i]]=getSymbols(tickers.mkt[i],src="yahoo",from=data.from,to=data.to,env=NULL)}
+
+# remove tickers w/ less than full number of records
+a=NULL
+for(i in 1:length(data.mkt.all)){a[i]=dim(data.mkt.all[[i]])}
+data.mkt.all[a!=2084]=NULL;data.mkt.all[10]=NULL
+
+# divide data across open, close, high, etc. tables
+data.mkt.tbls=list("op"=list(),"cl"=list(),"hi"=list(),"lo"=list(),"vol"=list())
+
+for(i in 1:length(data.mkt.all)){
+     if(i==1){
+          data.mkt.tbls$op=data.mkt.all[[i]][,1]
+          data.mkt.tbls$cl=data.mkt.all[[i]][,6]
+          data.mkt.tbls$hi=data.mkt.all[[i]][,2]
+          data.mkt.tbls$lo=data.mkt.all[[i]][,3]
+          data.mkt.tbls$vol=data.mkt.all[[i]][,5]
+     } else{
+          data.mkt.tbls$op=cbind(data.mkt.tbls$op,data.mkt.all[[i]][,1])
+          data.mkt.tbls$cl=cbind(data.mkt.tbls$cl,data.mkt.all[[i]][,6])
+          data.mkt.tbls$hi=cbind(data.mkt.tbls$hi,data.mkt.all[[i]][,2])
+          data.mkt.tbls$lo=cbind(data.mkt.tbls$lo,data.mkt.all[[i]][,3])
+          data.mkt.tbls$vol=cbind(data.mkt.tbls$vol,data.mkt.all[[i]][,5])
+     }
+}
+
+# save off xts files
+for(i in 1:length(data.mkt.tbls)){write.csv(data.mkt.tbls[[i]],file=paste0("proj_",names(data.mkt.tbls[i]),"_bak.csv"))}
+
+# select 25 for the portfolio
+set.seed(1234)
+prt.cols=sample(85,25)
+
+# create their data structures
+data.prt.all=data.mkt.all[prt.cols];prt.cols=prt.cols[order(prt.cols,decreasing=F)]
+data.prt.tbls=data.mkt.tbls;for(i in 1:length(data.prt.tbls)){data.prt.tbls[[i]]=data.prt.tbls[[i]][,prt.cols]}
+tickers.prt=names(data.prt.tbls$cl)
+
+# get market (sp500) and risk free (tbill) assets
+sp500=getSymbols("^GSPC",src="yahoo",from=data.from,to=data.to,env=NULL);sp500=sp500$GSPC.Adjusted
+tbill=getSymbols("^IRX",src="yahoo",from=data.from,to=data.from,env=NULL);tbill=tbill$IRX.Adjusted
+
+# intialize global variables
+rf_t=0.0001173 # based on 252 NYSE trading days / year i.e., 1.0001173^252=1.03
+amt=1000
+cst=0.001
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# function calculates pct change for a series.
+
+calc_pct_chg=function(series,amt,type="diff()"){
+     z=as.numeric(series)
+     chg=diff(z)/z[-length(z)]
+     rslt=rep(0,dim(series)[1]);rslt[1]=amt
+     for(i in 2:length(z)){
+          rslt[i]=rslt[i-1]*(1+chg[i-1])
+     }
+     rslt=as.xts(rslt,index(series))
+     return(rslt)
+}
+
+mkt.vals=calc_pct_chg(sp500$GSPC.Adjusted,amt,"diff()")
+
+# function calculates the buy-and-hold alternative
+
+calc_bh=function(prices,amt){
+     inv.amt=amt/dim(prices)[2] # $ per stock
+     shares=inv.amt/prices[1,] # num shares per stock
+     for(n in 1:dim(prices)[1]){
+          eod.val=sum(as.numeric(prices[n,])*as.numeric(shares))
+          if(exists("bh.p")){bh.p=rbind(bh.p,eod.val)}
+          else{bh.p=eod.val}
+     }
+     bh.p=as.xts(bh.p,index(prices))
+     return(bh.p)
+}
+
+bh.vals=calc_bh(data.mkt.tbls$cl,as.numeric(sp500[1,1]))
+
+#par(mfrow=c(1,1))
+#plot(mkt.vals,main="market vs. buy-hold portfolio",ylab="indexed value",
+#     ylim=range(rbind(as.numeric(bh.vals),as.numeric(mkt.vals))))
+#lines(bh.vals,col="red")
+#legend("topleft",legend=c("market","24-stock, equal weight portfolio"),
+#       lwd=2,cex=1,col=c("black","red"))
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# this section establishes train, test and validate periods based on market trend
+
+#test.periods=as.data.frame(matrix(c("2007-05-02","2008-04-14","red","train",
+#                                  "2008-05-02","2009-05-01","red","test",
+#                                  "2009-09-18","2010-08-27","blue","train",
+#                                  "2010-12-10","2011-12-02","blue","test",
+#                                  "2012-01-03","2013-01-02","green","train",
+#                                  "2013-02-19","2014-02-19","green","test",
+#                                  "2014-06-02","2014-10-15","red","val",
+#                                  "2014-10-16","2015-03-10","green","val",
+#                                  "2015-02-13","2015-06-26","blue","val"),
+#                                  9,4,byrow=TRUE))
+
+test.periods=as.data.frame(matrix(c(#"2007-05-02","2008-04-30","red","train",
+                                  "2008-05-01","2009-04-30","red","train",
+                                  #"2009-09-01","2010-08-31","blue","train",
+                                  "2010-12-01","2011-11-30","blue","train",
+                                  #"2012-01-03","2012-12-27","green","train",
+                                  "2013-02-01","2014-01-31","green","train"),
+                                  3,4,byrow=TRUE))
+
+# ensure test period cutoffs don't fall on weekends, holidays
+for(i in 1:dim(test.periods)[1]){
+     cat(test.periods[i,1],":",weekdays(as.Date(test.periods[i,1])),"\n")
+     cat(test.periods[i,2],":",weekdays(as.Date(test.periods[i,2])),"\n")
+}
+
+# lists to hold train, test and validate data sets
+trn.prt=list("red"=list(),"blu"=list(),"grn"=list());tst.prt=val.prt=trn.prt
+trn.mkt=list("red"=list(),"blu"=list(),"grn"=list());tst.mkt=val.mkt=trn.mkt
+
+# plot market (sp500) base data
+par(mfrow=c(1,1))
+plot(coredata(sp500$GSPC.Adjusted),type="l",main="test scenarios for sample (top) and s&p500 (bottom)",
+     col="grey",ylim=c(500,3300),xlab=paste(data.from,"to",data.to),ylab="s&p500 index")
+legend("topleft",legend=c("down market","flat market","up market"),
+       lwd=2,cex=1,col=c("red","blue","green"))
+
+bh.vals=calc_bh(data.mkt.tbls$cl,as.numeric(sp500[1,1]))
+lines(as.numeric(bh.vals),col="grey")
+
+# add lines for period classification. save data to appropriate list
+for(i in 1:dim(test.periods)[1]){
+     # plot the line
+     a=which(index(sp500)==as.Date(test.periods[i,1]))
+     b=which(index(sp500)==as.Date(test.periods[i,2]))
+     lines(a:b,coredata(sp500$GSPC.Adjusted[a:b]),col=as.character(test.periods[i,3]))
+     lines(a:b,bh.vals[a:b],col=as.character(test.periods[i,3]))
+     
+     # partion the portfolio data
+     if(test.periods[i,4]=="train"){
+          if(test.periods[i,3]=="red"){for(j in 1:5){trn.prt$red[[j]]=data.prt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="blue"){for(j in 1:5){trn.prt$blu[[j]]=data.prt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="green"){for(j in 1:5){trn.prt$grn[[j]]=data.prt.tbls[[j]][a:b]}}
+     #} else if(test.periods[i,4]=="test"){
+     #     if(test.periods[i,3]=="red"){for(j in 1:5){tst.prt$red[[j]]=data.prt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="blue"){for(j in 1:5){tst.prt$blu[[j]]=data.prt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="green"){for(j in 1:5){tst.prt$grn[[j]]=data.prt.tbls[[j]][a:b]}}
+     }# else if(test.periods[i,4]=="val"){
+     #     if(test.periods[i,3]=="red"){for(j in 1:5){val.prt$red[[j]]=data.prt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="blue"){for(j in 1:5){val.prt$blu[[j]]=data.prt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="green"){for(j in 1:5){val.prt$grn[[j]]=data.prt.tbls[[j]][a:b]}}
+     #}
+     
+     # partion the market data
+     if(test.periods[i,4]=="train"){
+          if(test.periods[i,3]=="red"){for(j in 1:5){trn.mkt$red[[j]]=data.mkt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="blue"){for(j in 1:5){trn.mkt$blu[[j]]=data.mkt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="green"){for(j in 1:5){trn.mkt$grn[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #} else if(test.periods[i,4]=="test"){
+     #     if(test.periods[i,3]=="red"){for(j in 1:5){tst.mkt$red[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="blue"){for(j in 1:5){tst.mkt$blu[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="green"){for(j in 1:5){tst.mkt$grn[[j]]=data.mkt.tbls[[j]][a:b]}}
+     }# else if(test.periods[i,4]=="val"){
+     #     if(test.periods[i,3]=="red"){for(j in 1:5){val.mkt$red[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="blue"){for(j in 1:5){val.mkt$blu[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="green"){for(j in 1:5){val.mkt$grn[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #}
+}
+names(trn.prt$red)=names(trn.prt$grn)=names(trn.prt$blu)=c("op","cl","hi","lo","vol")
+#names(tst.prt$red)=names(tst.prt$grn)=names(tst.prt$blu)=c("op","cl","hi","lo","vol")
+#names(val.prt$red)=names(val.prt$grn)=names(val.prt$blu)=c("op","cl","hi","lo","vol")
+names(trn.mkt$red)=names(trn.mkt$grn)=names(trn.mkt$blu)=c("op","cl","hi","lo","vol")
+#names(tst.mkt$red)=names(tst.mkt$grn)=names(tst.mkt$blu)=c("op","cl","hi","lo","vol")
+#names(val.mkt$red)=names(val.mkt$grn)=names(val.mkt$blu)=c("op","cl","hi","lo","vol")
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# function computes a month difference as a difference between two monnb's
+
+#start.date=as.Date("2007-05-01")
+#end.date=as.Date("2008-04-01")
+
+calc_mnths=function(start.date,end.date){
+     monnb=function(d){lt=as.POSIXlt(as.Date(d,origin="1900-01-01"));lt$year*12+lt$mon}
+     mondf=function(d1,d2){monnb(d2)-monnb(d1)}
+     mnths=mondf(start.date,end.date)+1
+}
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+extend <- function(x, n) 
+{ 
+   att <- attributes(x) 
+   length(x) <- n 
+   attributes(x) <- att 
+   x 
+} 
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6} 
+
+# calculates sharpe, treynor and other investment ratios for an input return series
+
+calc_ratios=function(ra,rb,rf,ttl=NA){
+     result=rbind(SharpeRatio(ra,rf,p=0.95,FUN="StdDev",weights=NULL,annualize=FALSE), 
+                  TreynorRatio(ra,rb,rf,scale=252,modified = FALSE), 
+                  SortinoRatio(ra,rf,weights=NULL),
+                  CalmarRatio(ra,scale=252),
+                  InformationRatio(ra,rb,scale=252),
+                  CAPM.alpha(ra,rb,rf)
+                  )
+     rownames(result)=c("sharpe","treynor","sortino","calmar","information","capm alpha") 
+     colnames(result)=ttl
+     return(result)
+}
+
+#calc_ratios(diff(log(sp500$GSPC.Adjusted)),diff(log(sp500$GSPC.Adjusted)),rf_t,"market ratios")
+#calc_ratios(diff(log(bh.vals)),diff(log(sp500$GSPC.Adjusted)),rf_t,"buy-hold ratios")
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# function enables quantile comparisons by plotting relative performance
+
+plot_qntl_perf=function(inList){
+     par(mfrow=c(3,1))
+     for(i in 1:length(inList)){
+          if(exists("plot.tmp")){plot.tmp=cbind(plot.tmp,inList[[i]][,1])}
+          else{plot.tmp=inList[[i]][,1]}
+     }
+     plot(plot.tmp[,1],type="l",main="performance: all quantiles",ylim=range(plot.tmp))
+     for(i in 2:dim(plot.tmp)[2]){lines(plot.tmp[,i],col=i)}
+     legend("topleft",legend=c(1:dim(plot.tmp)[2]),lwd=2,cex=1,col=c(1:dim(plot.tmp)[2]))
+     
+     mn=paste0("performance: first (q1) and last (q",dim(plot.tmp)[2],") quantiles")
+     plot(plot.tmp[,1],type="l",main=mn,
+          ylim=range(cbind(plot.tmp[,1],plot.tmp[,dim(plot.tmp)[2]])))
+     lines(plot.tmp[,dim(plot.tmp)[2]],col="red")
+     legend("topleft",legend=c("first quartile","last quartile"),lwd=2,cex=1,col=c("black","red"))
+     
+     mn=paste0("performance: q",dim(plot.tmp)[2],"-q1 cummulative return (",
+               round(plot.tmp[dim(plot.tmp)[1],dim(plot.tmp)[2]]-
+                          plot.tmp[dim(plot.tmp)[1],1])," at end)")
+     plot(plot.tmp[,length(inList)]-plot.tmp[,1],type="l",main=mn)
+     abline(h=0,col="red",lwd=2)
+     rm(plot.tmp)
+     # if time, equity curve
+}
+
+# function enables strategy comparisons by plotting relative performance
+
+plot_strat_perf=function(inList){
+     nms=names(inList)
+     par(mfrow=c(2,1))
+     for(v in 1:length(inList)){
+          if(exists("plot.tmp")){plot.tmp=cbind(plot.tmp,inList[[v]][,1])}
+          else{plot.tmp=inList[[v]][,1]}
+     }
+     plot(plot.tmp[,1],type="l",main="performance: all strategies",ylim=range(plot.tmp,na.rm=T))
+     for(i in 2:dim(plot.tmp)[2]){lines(plot.tmp[,i],col=i)}
+     legend("topleft",legend=nms,lwd=2,cex=0.8,col=c(1:dim(plot.tmp)[2]))
+     
+     end.vals=plot.tmp[dim(plot.tmp)[1],]
+     mx.cl=which.max(end.vals)
+     mn.cl=which.min(end.vals)
+     
+     mn=paste0("best (",nms[mx.cl],",black) vs. worst (",nms[mn.cl],",red). end diff = ",
+               round(end.vals[1,mx.cl]-end.vals[1,mn.cl]))
+     plot(plot.tmp[,mx.cl]-plot.tmp[,mn.cl],type="l",main=mn)
+     abline(h=0,col="red",lwd=2)
+     rm(plot.tmp)
+     # if time, equity curve
+}
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# function enables comparisons between quantiles portfolio and market and buy-hold portfolio by plotting return graphics.
+
+eval_returns=function(all.plot,mkt.vals,bh.vals,rf_t,start.date,end.date){
+     
+     bh.vals=bh.vals[paste0(start.date,"/",end.date)]
+     mkt.vals=mkt.vals[paste0(start.date,"/",end.date)]
+     
+     # only averages if you send it multiple series
+     for(i in 1:length(all.plot)){
+          if(i==1){
+               avg.eod.val=all.plot[[i]]$eod.vals[paste0(start.date,"/",end.date)]
+               grs.trades=all.plot[[i]]$trades[paste0(start.date,"/",end.date)]
+               net.states=all.plot[[i]]$states[paste0(start.date,"/",end.date)]
+               net.pnl=all.plot[[i]]$pnl[paste0(start.date,"/",end.date)]
+          }else{
+               avg.eod.val=avg.eod.val+all.plot[[i]]$eod.vals[paste0(start.date,"/",end.date)]
+               grs.trades=grs.trades+all.plot[[i]]$trades[paste0(start.date,"/",end.date)]
+               net.states=net.states+all.plot[[i]]$states[paste0(start.date,"/",end.date)]
+               net.pnl=net.pnl+all.plot[[i]]$pnl[paste0(start.date,"/",end.date)]
+          }
+     }
+     avg.eod.val=avg.eod.val/length(all.plot)
+     
+     # format graphics
+     par(mfcol=c(3,1))
+     plot(mkt.vals,main="portfolio values",ylim=range(rbind(avg.eod.val,bh.vals,mkt.vals)))
+     lines(avg.eod.val,col="blue")
+     lines(bh.vals,col="red")
+     legend("topleft",legend=c("market","quantiles (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+     plot(net.states,main="states",type="l")
+     
+     plot(net.pnl,main="PNL",type="l")
+
+     port.ratios.val=calc_ratios(diff(log(avg.eod.val))[-1],
+                                 diff(log(mkt.vals))[-1],rf_t,"portfolio ratios")
+     bh.ratios=calc_ratios(diff(log(bh.vals))[-1],diff(log(mkt.vals))[-1],
+                           rf_t,"b-h ratios")
+     
+     port.val=avg.eod.val[dim(avg.eod.val)[1]];colnames(port.val)="portfolio value"
+     port.v.bh=avg.eod.val[dim(avg.eod.val)[1]]-as.numeric(bh.vals[dim(bh.vals)[1]])
+     colnames(port.v.bh)="portfolio vs. buy-hold"
+     port.pnl=net.pnl[dim(avg.eod.val)[1]];colnames(port.pnl)="portfolio profit/loss"
+     
+     rslt=list(port.val=port.val,
+               port.v.bh=port.v.bh,
+               port.pnl=port.pnl,
+               port.ratios.val=port.ratios.val,
+               #port.ratios.pnl=port.ratios.pnl,
+               bh.ratios=bh.ratios)
+     return(rslt)
+}
+     
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# function calculates daily returns from technical strategy predictions
+
+score_preds=function(inPrcMtrx,
+                     inScrMtrx,
+                     amt.strt,
+                     amt.trd,
+                     amt.cst,
+                     sp500,
+                     rf_t,
+                     out,
+                     co_plot=NULL){
+     
+     # valid out values: series, plot, ratios, all
+     
+     start.date=index(inScrMtrx)[1]
+     end.date=index(inScrMtrx)[dim(inScrMtrx)[1]]
+     
+     for(i in 1:dim(inPrcMtrx)[2]){ # each ticker
+          
+          m=cbind(inPrcMtrx[paste0(start.date,"/",end.date)][,i],
+                  inScrMtrx[paste0(start.date,"/",end.date)][,i])
+          colnames(m)=c("price","score")
+          
+          m$states=m$trades=m$cash=m$pnl=0
+          
+          start=2
+          
+          for(j in start:dim(m)[1]){ # each period 
+               
+               # trading conditions
+               if (j==start || m$states[j-1]==0) {
+                    if (abs(as.numeric(m$score[j])) > 0){m$trades[j]=1
+                                                         m$states[j]=as.numeric(m$score[j])*amt.trd} # initiate trade
+               }
+               else if (m$states[j-1]!=0){
+                   if(m$score[j]>0 && m$states[j-1]>0){m$states[j]=as.numeric(m$score[j])*amt.trd} # mod/keep trade
+                   else if(m$score[j]<0 && m$states[j-1]<0){m$states[j]=as.numeric(m$score[j])*amt.trd} # mod/keep
+                   else{m$trades[j]=1;m$states[j]=0} # close the trade
+              }
+              
+              # update cash, pnl
+              if(j==start){m$cash[j]=amt.strt-(as.numeric(m$price[j])*(1-amt.cst))*as.numeric(m$states[j])}
+              else{m$cash[j]=as.numeric(m$cash[j-1])-(as.numeric(m$price[j])*(1-amt.cst))*
+                        (as.numeric(m$states[j])-as.numeric(m$states[j-1]))}
+              m$pnl[j]=as.numeric(m$cash[j])+as.numeric(m$states[j])*as.numeric(m$price[j])
+          }
+          
+          if(out=="all"){
+               if(is.null(co_plot) || co_plot==i){
+                    
+                    par(mfrow=c(3,1))
+                    tck=substr(names(inPrcMtrx)[i],1,(regexpr("[.]",names(inPrcMtrx[i]))-1))
+                    plot(m$states,main=paste0(tck,": states"),type="n");lines(m$states,col="blue")
+                    plot(m$cash,main=paste0(tck,": cash"),type="n");lines(m$cash,col="blue")
+         
+                    bh.vals=calc_bh(m$price,amt.strt)
+               
+                    plot(bh.vals[-1],main=paste0(tck,": pnl"),ylim=range(cbind(bh.vals[-1],m$pnl[-1])))
+                    lines(m$pnl[-1],col="blue")
+                    lgn1=paste0(tck," b-h");lgn2=paste0(tck," active")
+                    legend("topleft",legend=c(lgn1,lgn2),lwd=2,cex=1,col=c("black","blue"))
+                    
+               }
+          }
+          
+          if(exists("pnls")){pnls=cbind(pnls,m$pnl)}else{pnls=m$pnl}
+     }
+     
+     bh.price=calc_bh(inPrcMtrx[paste0(start.date,"/",end.date)][-1],amt.strt)
+     bh.pnl=calc_bh(pnls[-1],amt.strt)
+     
+     if(out=="all" || out=="summary"){
+          par(mfrow=c(1,1))
+          plot(bh.price,main="portfolio values",ylim=range(cbind(bh.price,bh.pnl)))
+          lines(bh.pnl,col="blue")
+          legend("topleft",legend=c("b-h portfolio, equal wt","active portfolio"),
+                 lwd=2,cex=1,col=c("black","blue"))
+     }
+     if(out=="ratios" || out=="all" || out=="summary"){
+          price=calc_ratios(diff(log(bh.price)),
+                            diff(log(sp500[paste0(start.date,"/",end.date)][-1])),
+                            rf_t,"s&p 500")
+          pnl=calc_ratios(diff(log(bh.pnl)),
+                          diff(log(sp500[paste0(start.date,"/",end.date)][-1])),
+                          rf_t,"active portfolio")
+     }
+     if(out=="series"){return(list(price=bh.price,pnl=bh.pnl))}
+     else if(out=="ratios"){return(list(price=price,pnl=pnl))}
+     else if(out=="all" || out=="summary"){return(list(series=list(price=bh.price,pnl=bh.pnl),
+                                     ratios=list(price=price,pnl=pnl)))}
+}
+
+```
+
+## strategy
+### technical strategies
+Two predictive technical models are used: moving average and momentum. While deeper discussion of each follows, I'll first overview common features engineered to make the models adapt quickly to the volatile time series selected.
+
+At the beginning of a data set and each month, a contoller causes the underlying models to refit their moving average, momentum and volatility settings *for each stock in the portfolio* based on the data from the prior month. Fits are derived by a recursive grid search over all the main features including lookback periods for price means and volatility measures (separately), holding periods and thresholds, etc. *The fit is then used to make rolling day-before predictions and, if appropriate, trades*. 
+
+The models also stay long and short longer than they ordinarily would. The objective of these technical models is not just to maximize profit. They are also used to signal a state of the underlying market. So, for example, while the momentum model may go short when the short term moving average exceeds the long term by a threshold amount, it won't close the trade until the distances have compressed, almost completely. Clearly, would add to risk if we were operating the models individually. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# this function controls the moving average and momentum technical indicator functions
+
+ctrl_tech=function(inList,
+                    pred.date,
+                    sp500,
+                    rf_t){ # runs thru all records in data set starting w/ prcs.start date
+     
+     # define variables
+     pred.rcd=which(index(inList$cl)==as.Date(pred.date))
+     
+     amt.strt=1000
+     amt.trd=100
+     amt.cst=0.001
+     
+     # initialize return list
+     daily.preds=list()
+     
+     # process records
+     for(i in pred.rcd:dim(inList$cl)[1]){ # process days #dim(inList$cl)[1])
+          
+          cur.date=as.Date(index(inList$cl)[i])
+          lb.date.mav=cur.date-months(1)
+          if(i==pred.rcd){lb.date.mov=cur.date-months(1)}
+          else{lb.date.mov=cur.date-months(2)}
+          
+          for(j in 1:dim(inList$cl)[2]){ # process stocks #dim(inList$cl)[2])
+               
+               if(i==pred.rcd || format(cur.date,"%m")==next.month){ # initate monthly re-fit
+                    
+                    bst.mav=mav_ctrl(inMtrx=cbind(inList$cl[,j][paste0(lb.date.mav,"/",cur.date)],
+                                                  inList$vol[,j][paste0(lb.date.mav,"/",cur.date)]),
+                                     amt.strt=amt.strt,
+                                     amt.trd=amt.trd,
+                                     amt.cst=amt.cst,
+                                     sp500=sp500,
+                                     rf_t=rf_t,
+                                     obj="fit")
+                    
+                    bst.mov=mov_ctrl(inMtrx=cbind(inList$cl[,j][paste0(lb.date.mov,"/",cur.date)],
+                                                  inList$vol[,j][paste0(lb.date.mov,"/",cur.date)]),
+                                     amt.strt=amt.strt,
+                                     amt.trd=amt.trd,
+                                     amt.cst=amt.cst,
+                                     sp500=sp500,
+                                     rf_t=rf_t,
+                                     obj="fit")
+                    
+                    next.month=format(update(cur.date,day=1)+months(1),"%m")
+               }
+                              
+               pred.mav=mav_ctrl(inMtrx=cbind(inList$op[,j][paste0(lb.date.mav,"/",cur.date)],
+                                   inList$vol[,j][paste0(lb.date.mav,"/",cur.date)]),
+                             p.lag=as.numeric(bst.mav$pLag),
+                             p.wt=as.numeric(bst.mav$pWt),
+                             v.lag=as.numeric(bst.mav$vLag),
+                             v.thr=as.numeric(bst.mav$vThr),
+                             hld=as.numeric(bst.mav$hld),
+                             amt.strt=amt.strt,
+                             amt.trd=amt.trd,
+                             amt.cst=amt.cst,
+                             sp500=sp500,
+                             rf_t=rf_t,
+                             obj="pred")
+               
+               pred.mov=mov_ctrl(inMtrx=cbind(inList$op[,j][paste0(lb.date.mov,"/",cur.date)],
+                                   inList$vol[,j][paste0(lb.date.mov,"/",cur.date)]),
+                             p.lng=as.numeric(bst.mov$pLng),
+                             p.shrt=as.numeric(bst.mov$pShrt),
+                             v.lag=as.numeric(bst.mov$vLag),
+                             v.thr=as.numeric(bst.mov$vThr),
+                             hld=as.numeric(bst.mov$hld),
+                             amt.strt=amt.strt,
+                             amt.trd=amt.trd,
+                             amt.cst=amt.cst,
+                             sp500=sp500,
+                             rf_t=rf_t,
+                             obj="pred")
+               
+               if(exists("pred.mavs")){pred.mavs=cbind(pred.mavs,pred.mav)}else{pred.mavs=pred.mav}
+               if(exists("pred.movs")){pred.movs=cbind(pred.movs,pred.mov)}else{pred.movs=pred.mov}
+               
+          }
+          if(exists("pred.mavs.mstr")){pred.mavs.mstr=rbind(pred.mavs.mstr,pred.mavs)}else{pred.mavs.mstr=pred.mavs}
+          if(exists("pred.movs.mstr")){pred.movs.mstr=rbind(pred.movs.mstr,pred.movs)}else{pred.movs.mstr=pred.movs}
+          rm(pred.mavs)
+          rm(pred.movs)
+     }
+     daily.preds$mav=pred.mavs.mstr;write.csv(pred.mavs.mstr,file=paste0("proj_mav_preds_bak.csv"))
+     daily.preds$mov=pred.movs.mstr;write.csv(pred.movs.mstr,file=paste0("proj_mov_preds_bak.csv"))
+     
+     # name columns
+     tck=substr(names(inList$cl),1,regexpr("[.]",names(inList$cl)))
+     ttls=paste0(tck,"pred")
+     for(z in 1:length(daily.preds)){colnames(daily.preds[[z]])=ttls}
+     
+     return(daily.preds)
+}
+
+```
+
+#### moving average
+The moving average technical indicator is used to signal where the market price for each stock in the portfolio is in relation to it's *short term* history. The indicator is re-fit monthly with lags of 2 to 11 days for the mean calculation and a variable weight or threshold applied to that mean. The monthly process also re-fits the lag period for average volume and its standard deviation (volatility). 
+
+The moving average function buys shares when current price is below its moving average and shorts shares when the current price is above. In both cases, the moving average function increases trade size by 50% if the change in price is large when compared to recent history. Finally, while the function may trim trade side (close out a minority of shares), at the end of the hold period, it will not close out all shares until the current and moving average prices reconverge.  
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+mav_ctrl=function(inMtrx,
+                  p.lag=NULL,
+                  p.wt=NULL,
+                  v.lag=NULL,
+                  v.thr=NULL,
+                  hld=NULL,
+                  amt.strt,
+                  amt.trd,
+                  amt.cst,
+                  sp500,
+                  rf_t,
+                  obj,
+                  out=NULL){
+     
+     if(obj=="fit"){
+          for(i in 1:2){
+
+               if(i==1){
+                    if(is.null(p.lag)){p.lag=seq(2,11,3)}
+                    if(is.null(p.wt)){p.wt=seq(0.95,1.04,0.03)}
+                    if(is.null(v.lag)){v.lag=seq(3,12,3)}
+                    if(is.null(v.thr)){v.thr=seq(1.4,2.3,0.3)}
+                    if(is.null(hld)){hld=seq(1,2,1)}
+                    
+               } else{
+                    p.lag=seq(if(best$pLag[1]==2){2}else{as.numeric(best$pLag[1])-1},as.numeric(best$pLag[1])+1,1)
+                    p.wt=seq(as.numeric(best$pWt)-0.01,as.numeric(best$pWt)+0.01,0.01)
+                    v.lag=seq(as.numeric(best$vLag)-1,as.numeric(best$vLag)+1,1)
+                    v.thr=seq(as.numeric(best$vThr)-0.1,as.numeric(best$vThr)+0.1,0.1)
+                    hld=as.numeric(best$hld)
+               }
+               for(l in 1:length(p.lag)){
+                    for(w in 1:length(p.wt)){
+                         for(v in 1:length(v.lag)){
+                              for(t in 1:length(v.thr)){
+                                   for(h in 1:length(hld)){
+                                        out1="pnl"
+                                        gl=mav(rtrn=inMtrx,
+                                               p.lag=p.lag[l],
+                                               p.wt=p.wt[w],
+                                               v.lag=v.lag[v],
+                                               v.thr=v.thr[t],
+                                               hld=hld[h],
+                                               amt.strt=amt.strt,
+                                               amt.trd=amt.trd,
+                                               amt.cst=amt.cst,
+                                               sp500=sp500,
+                                               rf_t=rf_t,
+                                               out=out1,
+                                               obj=obj)
+                                        
+                                        rslt=cbind(p.lag[l],
+                                                   p.wt[w],
+                                                   v.lag[v],
+                                                   v.thr[t],
+                                                   hld[h],
+                                                   amt.strt,
+                                                   amt.trd,
+                                                   amt.cst,
+                                                   obj,
+                                                   out1,
+                                                   gl)
+
+                                        colnames(rslt)=c("pLag","pWt","vLag","vThr","hld",
+                                                      "amtStrt","amtTrd","amtCst","obj","out","gl")
+                                        
+                                        if(exists("rslt.mstr")){rslt.mstr=rbind(rslt.mstr,rslt)}
+                                        else{rslt.mstr=rslt}
+                                   }
+                              }
+                         }  
+                    }
+               }
+               best=rslt.mstr[which.max(rslt.mstr$gl),]
+          }
+          rslt.mstr=best
+     } else if(obj=="pred"){
+          out2="pred"
+          rslt.mstr=mav(rtrn=inMtrx,
+                   p.lag=p.lag,
+                   p.wt=p.wt,
+                   v.lag=v.lag,
+                   v.thr=v.thr,
+                   hld=hld,
+                   amt.strt=amt.strt,
+                   amt.trd=amt.trd,
+                   amt.cst=amt.cst,
+                   sp500=sp500,
+                   rf_t=rf_t,
+                   out=out2,
+                   obj=obj)
+     }
+     return(rslt.mstr)
+}
+
+mav=function(rtrn,
+             p.lag,
+             p.wt,
+             v.lag,
+             v.thr,
+             hld,
+             amt.strt,
+             amt.trd,
+             amt.cst,
+             sp500,
+             rf_t,
+             out,
+             obj){
+
+     rtrn$score=0
+     
+     prc=as.numeric(rtrn[,1])
+     vol=as.numeric(rtrn[,2])
+     
+     if(obj=="pred"){start=dim(rtrn)[1]}
+     else if(obj=="fit"){start=max(p.lag,v.lag)}
+     
+     for (i in start:dim(rtrn)[1]){
+          mu=mean(prc[(i-(p.lag-1)):i])
+          v.sd=sd(vol[(i-(v.lag-1)):i])
+          v.dif=abs(vol[i]-vol[i-1])
+          
+          # moving average
+          if(prc[i]>(mu*p.wt)){rtrn$score[i]=-1}
+          else if(prc[i]<((1/p.wt)*mu)){rtrn$score[i]=1}
+          if(v.dif>(v.sd*v.thr)){rtrn$score[i]=as.numeric(rtrn$score[i])*1.5}
+     }
+     if(obj=="fit"){
+          
+       if(out=="plot"){
+               score_preds(inPrcMtrx=rtrn[,1],
+                           inScrMtrx=rtrn$score,
+                           amt.strt=amt.strt,
+                           amt.trd=amt.trd,
+                           amt.cst=amt.cst,
+                           sp500=sp500,
+                           rf_t=rf_t,
+                           out="plot")
+          
+          }else if(out=="pnl"){               
+               pnl.mav=score_preds(inPrcMtrx=rtrn[,1],
+                                   inScrMtrx=rtrn$score,
+                                   amt.strt=amt.strt,
+                                   amt.trd=amt.trd,
+                                   amt.cst=amt.cst,
+                                   sp500=sp500,
+                                   rf_t=rf_t,
+                                   out="series")
+               
+               return(pnl.mav$pnl[dim(pnl.mav$pnl)[1]]) # this c/b the problem
+          }
+     }else if(obj=="pred" && out=="pred"){rtrn$score[i]}
+}
+
+```
+
+#### momentum
+Like moving average, while the momentum indicator trades, it is also signals an change in price for each stock in the portfolio in relation to its *intermediate term* history. The momentum model balances a long term (i.e., 15-24 day) moving average price and a short term moving average (2-11 days) for each stock in the portfolio. It buys when the short term moving average is below the long term and shorts when its above. It increases trade size by 50% if a volume spike is concident with the change to the moving average. Monthly re-fits optimize the lookback periods for the moving averages, volume and volatility lags and the holding period. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+mov_ctrl=function(inMtrx,
+                  p.lng=NULL,
+                  p.shrt=NULL,
+                  v.lag=NULL,
+                  v.thr=NULL,
+                  hld=NULL,
+                  amt.strt,
+                  amt.trd,
+                  amt.cst,
+                  sp500,
+                  rf_t,
+                  obj,
+                  out=NULL){
+
+     if(obj=="fit"){
+          for(i in 1:2){
+               if(i==1){
+                    if(is.null(p.lng)){p.lng=seq(15,24,3)}
+                    if(is.null(p.shrt)){p.shrt=seq(2,11,3)}
+                    if(is.null(v.lag)){v.lag=seq(3,12,3)}
+                    if(is.null(v.thr)){v.thr=seq(1.0,1.9,0.3)}
+                    if(is.null(hld)){hld=seq(2,6,2)}
+                    
+               } else{
+                    p.lng=seq(as.numeric(best$pLng)-1,as.numeric(best$pLng)+1,1)
+                    p.shrt=seq(if(best$pShrt[1]==2){2}else{as.numeric(best$pShrt[1])-1},as.numeric(best$pShrt[1])+1,1)
+                    v.lag=seq(if(best$vLag[1]==3){3}else{as.numeric(best$vLag)-1},as.numeric(best$vLag)+1,1)
+                    v.thr=seq(as.numeric(best$vThr)-0.1,as.numeric(best$vThr)+0.1,0.1)
+                    hld=seq(if(best$hld[1]==1){1}else{as.numeric(best$hld)-1},as.numeric(best$hld)+1,1)
+               }
+               for(l in 1:length(p.lng)){
+                    for(w in 1:length(p.shrt)){
+                         for(v in 1:length(v.lag)){
+                              for(t in 1:length(v.thr)){
+                                   for(h in 1:length(hld)){
+                                        out1="pnl"
+                                        gl=mov(rtrn=inMtrx,
+                                               p.lng=p.lng[l],
+                                               p.shrt=p.shrt[w],
+                                               v.lag=v.lag[v],
+                                               v.thr=v.thr[t],
+                                               hld=hld[h],
+                                               amt.strt=amt.strt,
+                                               amt.trd=amt.trd,
+                                               amt.cst=amt.cst,
+                                               sp500=sp500,
+                                               rf_t=rf_t,
+                                               out=out1,
+                                               obj=obj)
+                                        
+                                        rslt=cbind(p.lng[l],
+                                                   p.shrt[w],
+                                                   v.lag[v],
+                                                   v.thr[t],
+                                                   hld[h],
+                                                   amt.strt,
+                                                   amt.trd,
+                                                   amt.cst,
+                                                   obj,
+                                                   out1,
+                                                   gl)
+
+                                        colnames(rslt)=c("pLng","pShrt","vLag","vThr","hld",
+                                                      "amtStrt","amtTrd","amtCst","obj","out","gl")
+                                        
+                                        if(exists("rslt.mstr")){rslt.mstr=rbind(rslt.mstr,rslt)}
+                                        else{rslt.mstr=rslt}
+                                   }
+                              }
+                         }  
+                    }
+               }
+               best=rslt.mstr[which.max(rslt.mstr$gl),]
+          }
+          rslt.mstr=best
+     } else if(obj=="pred"){
+          out2="pred"
+          rslt.mstr=mov(rtrn=inMtrx,
+                   p.lng=p.lng,
+                   p.shrt=p.shrt,
+                   v.lag=v.lag,
+                   v.thr=v.thr,
+                   hld=hld,
+                   amt.strt=amt.strt,
+                   amt.trd=amt.trd,
+                   amt.cst=amt.cst,
+                   sp500=sp500,
+                   rf_t=rf_t,
+                   out=out2,
+                   obj=obj)
+     }
+     return(rslt.mstr)
+}
+
+mov=function(rtrn,
+             p.lng,
+             p.shrt,
+             v.lag,
+             v.thr,
+             hld,
+             amt.strt,
+             amt.trd,
+             amt.cst,
+             sp500,
+             rf_t,
+             out,
+             obj){
+
+     rtrn$relation=0
+     rtrn$score=0
+
+     prc=as.numeric(rtrn[,1])
+     vol=as.numeric(rtrn[,2])
+     hld.ctr=0
+     
+     if(p.lng>dim(rtrn)[1]){p.lng=dim(rtrn)[1]}
+     
+     if(obj=="pred"){start=(dim(rtrn)[1]-1)}
+     else if(obj=="fit"){start=p.lng}
+     
+     for (i in start:dim(rtrn)[1]){
+          
+          if(i<p.lng){mu.lng=mean(prc[1:i],na.rm=TRUE)}
+          else{mu.lng=mean(prc[(i-(p.lng-1)):i],na.rm=TRUE)}
+          
+          if(i<p.shrt){mu.shrt=mean(prc[1:i],na.rm=TRUE)}
+          else{mu.shrt=mean(prc[(i-(p.shrt-1)):i],na.rm=TRUE)}
+          
+          if(mu.shrt>=mu.lng){rtrn$relation[i]=-1}else{rtrn$relation[i]=1}
+          
+          if(sign(as.numeric(rtrn$relation[i]))==sign(as.numeric(rtrn$relation[i-1]))){
+               if(hld.ctr>=hld){rtrn$score[i]=0;hld.ctr=0}
+               else{rtrn$score[i]=rtrn$score[i-1];hld.ctr=hld.ctr+1}
+          } else{
+               if(rtrn$relation[i]==-1){rtrn$score[i]=-1}
+               else if(rtrn$relation[i]==1){rtrn$score[i]=1}
+               v.sd=sd(vol[(i-(v.lag-1)):i])
+               v.dif=abs(vol[i]-vol[i-1])
+               if(v.dif>(v.sd*v.thr)){rtrn$score[i]=as.numeric(rtrn$score[i])*1.5}
+          }
+     }
+     
+     if(obj=="fit"){
+          
+       if(out=="plot"){
+               score_preds(inPrcMtrx=rtrn[,1],
+                           inScrMtrx=rtrn$score,
+                           amt.strt=amt.strt,
+                           amt.trd=amt.trd,
+                           amt.cst=amt.cst,
+                           sp500=sp500,
+                           rf_t=rf_t,
+                           out="plot")
+          
+          }else if(out=="pnl"){               
+               pnl.mov=score_preds(inPrcMtrx=rtrn[,1],
+                                   inScrMtrx=rtrn$score,
+                                   amt.strt=amt.strt,
+                                   amt.trd=amt.trd,
+                                   amt.cst=amt.cst,
+                                   sp500=sp500,
+                                   rf_t=rf_t,
+                                   out="series")
+               
+               return(pnl.mov$pnl[dim(pnl.mov$pnl)[1]]) # this c/b the problem
+          }
+     }else if(obj=="pred"){rtrn$score[i]}
+}
+
+```
+
+### portfolio strategies
+The portfolio strategies are based on three key components: momentum and volatility quantiles, strategy grids and lag fitting. I cover each below. However, at a high-level, each month the portfolio function looks at what worked for all 85 "market" stocks over the prior months. Specfically, it links Jegadeesh momentum and Han momentum + volatility quantiles in the lagged months to performance in the immediately prior month. Then it selects, from among five options, the strategy that maximizes the return. It buys the subset of stocks *in the 24-stock portfolio* that are predicted to rise the most (usually 3-5 stocks) and sells the subset predicted to rise the least. The model then rolls forward a month, tabulates the daily portfolio values and calculats the gain/loss from each of the positions accumulating them into a portfolio pnl.  
+
+##### momentum and volatility quantile portfolios
+At the start of a new data set and each month thereafter, the model builds a base set of momentum and volatility portfolios for a range of 2-8 quantiles. It does this using the basic momentum and strategy formulations provided by Jegadeesh and Han. The lookback period for quantile portfolio creation can span from 1 to 5 months. However, the investment period is always one month. During the lookback period, the model performs monthly quantile classification, assigns stocks to portfolios, tracks returns and then reports performance. So, each month, 2, 4, 6 and 8 quantile portfolios are fit and performance is tracked for both the Jagedeesh and Han methodologies for lookbacks of 1-6 months. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+# function creates momentum and or momentum + volatility quantile portfolios
+
+momo_ctrl=function(m,
+                    start.date,
+                    mnths,
+                    exclude,
+                    lag,
+                    hold,
+                    qntls,
+                    amt=100,
+                    cst=0.001,
+                    output="full",
+                    vrs="momo",
+                    plot="yes"){  
+               
+     for(l in 1:length(lag)){
+          for(h in 1:length(hold)){
+               for(q in 1:length(qntls)){
+                    qntl.rslt=momo_qntls(m,start.date,mnths,exclude,lag[l],hold[h],
+                                         qntls[q],amt,cst,output,vrs,plot)
+                    if(output=="pnl"){
+                         pnl.rslt=matrix(NA,1,13)
+                         row.rslt=cbind(lag[l],hold[h],qntls[q],qntl.rslt) # future: add "vrs"
+                         pnl.rslt[1,c(1:dim(row.rslt)[2])]=row.rslt
+                         if(exists("momo.mstr")){momo.mstr=rbind(momo.mstr,pnl.rslt)}
+                         else{momo.mstr=pnl.rslt}
+                    }
+                    else{momo.mstr=qntl.rslt}                         
+               }
+          }
+     }
+     return(momo.mstr)
+}
+
+momo_qntls=function(m,start.date,mnths,exclude,lag,hold,qntls,amt,cst,output,vrs,plot){
+     
+     perf=list()
+     ports=list()
+     ctrs=list()
+     
+     # grab monthly records, calculate returns and assign stocks to portfolios
+     for(i in 1:mnths){              
+          cur.date=start.date
+          month(cur.date)=month(cur.date)+(i-1)          
+          if(i==1 && !is.null(exclude)){
+               while(month(cur.date) %in% exclude){month(cur.date)=month(cur.date)+1}
+          }
+          lb.date=cur.date;month(lb.date)=month(lb.date)-lag
+          inv.date=cur.date;month(inv.date)=month(inv.date)+1
+          lb.rcds=m[paste0(lb.date,"/",cur.date-1)] # lookback period data
+          per.rcds=m[paste0(cur.date,"/",inv.date-1)] # investment period data
+          
+          # determine portfolio assignments
+          portAssign=rep(0,dim(lb.rcds)[2]) # length(lb.rtrn)
+          if(vrs=="momo"){
+               # calculate lookback return quantiles
+               lb.rtrn=(as.numeric(lb.rcds[dim(lb.rcds)[1],])-as.numeric(lb.rcds[1,]))/
+                    as.numeric(lb.rcds[1,])
+               
+               lb.rtrn.breaks=quantile(lb.rtrn,probs=seq(0,1,1/qntls))
+          
+               for(j in 1:(length(lb.rtrn.breaks)-1)){
+                    portAssign[which(lb.rtrn>=lb.rtrn.breaks[j])]=j
+               }
+          }
+          else if(vrs=="vol"){
+               # calculate lookback volatility quantiles
+               lb.vol=sapply(lb.rcds,sd)
+               
+               lb.vol.breaks=quantile(lb.vol,probs=seq(0,1,1/qntls))
+          
+               for(j in 1:(length(lb.vol.breaks)-1)){
+                    portAssign[which(lb.vol>=lb.vol.breaks[j])]=j
+               }
+          }
+          #port.rslt=prcs_port(m,i,per.rcds,portAssign,cur.date,mnths,exclude,hold,qntls,amt,cst)
+     
+          # process transactions for each quantile
+          for(k in 1:(length(unique(portAssign)))){
+               # process sells
+               if(i==1){
+                    per.inv.amt=amt*(1-cst)
+                    toSell=dim(m)[2]/qntls
+               } # kludge
+               else{
+                    # get quantile-specific stored ledger and counters
+                    port.lgr=ports[[k]]
+                    ctr=ctrs[[k]]
+                    
+                    # determine proceeds from sells
+                    sale.proceeds=sum(port.lgr[ctr-hold,]*as.numeric(per.rcds[dim(per.rcds)[1],]))*(1-cst)
+                    per.inv.amt=sale.proceeds*(1-cst)
+                    toSell=sum(port.lgr[ctr-hold,]>0)
+               }
+               
+               # calc equal $ value investments
+               qtl.rcds=per.rcds[,portAssign==k]
+               stk.inv.amt=(per.inv.amt/length(qtl.rcds[1,]))*(1-cst)
+               shares=stk.inv.amt/qtl.rcds[1,]
+               
+               # update portfolio holdings
+               if(i==1){
+                    #cat("********* ctrl_port: if: start.date",start.date)
+                    if(start.date==as.Date("2007-05-05")){xts.bgn="2007-05-01"}else{xts.bgn=start.date}
+                    port.lgr=as.xts(as.data.frame(matrix(0,mnths+hold,dim(m)[2])),
+                                    order.by=seq.Date(as.Date(xts.bgn),,by="month",mnths+hold))
+                    colnames(port.lgr)=names(m)
+                    if(!(month(cur.date) %in% exclude)){
+                         for(w in 1:hold){
+                              postCols=which(names(port.lgr) %in% names(qtl.rcds))
+                              toBuy=as.numeric(shares)/hold
+                              for(z in 1:length(postCols)){port.lgr[w,postCols[z]]=toBuy[z]}
+                         }
+                    }
+                    ctr=hold+1
+               }else{
+                    postCols=which(names(port.lgr) %in% names(qtl.rcds))
+                    toBuy=as.numeric(shares)
+                    if(!(month(cur.date) %in% exclude)){
+                         for(z in 1:length(postCols)){
+                              port.lgr[ctr,postCols[z]]=as.xts(toBuy[z],as.Date(cur.date,))
+                         }
+                    }
+                    ctr=ctr+1
+               }
+               ports[[k]]=port.lgr
+               ctrs[[k]]=ctr
+               
+               # calc daily portfolio value
+               for(n in 1:dim(per.rcds)[1]){
+                    holdings=colSums(port.lgr[(ctr-hold):ctr,])
+                    eod.val=sum(as.numeric(per.rcds[n,])*holdings)
+                    if(exists("per.rtrns")){per.rtrns=rbind(per.rtrns,eod.val)}
+                    else{per.rtrns=eod.val}
+               }
+               # cool R re-formatting waste of time
+               rownames(per.rtrns)=c(1:dim(per.rtrns)[1]);colnames(per.rtrns)=c("eod.vals")
+               per.rtrns=as.data.frame(per.rtrns)
+               per.rtrns$states=0;per.rtrns$trades=0;per.rtrns$pnl=0 #per.rtrns$cash=0;
+               
+               # create transaction records
+               for (q in 1:(dim(per.rtrns)[1])){
+                    if(i==1 && q==1 && !(month(cur.date) %in% exclude)){
+                         #cat("in third i==1 loop: k:",k,"\n")
+                         per.rtrns$states[q]=per.inv.amt
+                         per.rtrns$trades[q]=length(toBuy)
+                         per.rtrns$pnl[q]=per.inv.amt-amt
+                    }
+                    else if(q==1 && !(month(cur.date) %in% exclude)){
+                         per.rtrns$states[q]=per.inv.amt
+                         per.rtrns$trades[q]=length(toBuy)
+                         per.rtrns$pnl[q]=per.rtrns$eod.vals[q]-amt # kludge s/b prior eod
+                    }
+                    else if(q>1 && q<dim(per.rtrns)[1]){
+                         per.rtrns$states[q]=per.rtrns$states[q-1]
+                         per.rtrns$trades[q]=0
+                         per.rtrns$pnl[q]=per.rtrns$pnl[q-1]
+                    }
+                    else if(q==dim(per.rtrns)[1]){
+                         per.rtrns$states[q]=-per.inv.amt
+                         per.rtrns$trades[q]=toSell
+                         # assuming we value pnl monthly when we make any sales
+                         per.rtrns$pnl[q]=per.rtrns$eod.vals[q]-amt
+                    }
+               }
+               per.rtrns=as.xts(per.rtrns,index(per.rcds))
+               if(i==1){perf[[k]]=per.rtrns}
+               else{perf[[k]]=rbind(perf[[k]],per.rtrns)}
+               rm(per.rtrns)
+          }
+          
+     }
+     if(plot=="yes"){plot_qntl_perf(perf)}
+     
+     # produce a table of pnl results for all portfolio permuations processed
+     for(z in 1:qntls){
+          pnl.perf=perf[[z]]$pnl[dim(perf[[z]])[1]]
+          if(exists("pnls.perf")){pnls.perf=cbind(pnls.perf,pnl.perf)}else{pnls.perf=pnl.perf}
+     }
+     
+     # return performance 
+     if(output=="pnl"){return(pnls.perf)}
+     else if(output=="perf"){return(list(pnls=pnls.perf,perf=perf))}
+     else if(output=="ports"){return(list(pnls=pnls.perf,ports=ports))}
+     else if(output=="full"){return(list(pnls=pnls.perf,perf=perf,ports=ports))}
+}
+
+```
+
+##### strategies
+The strategies then link the quantile portfolios and their returns to a specific set of longs and shorts for the next month. There are five strategies:
+
+1. *jega*: momentum metric, 8 quantiles, buy top 2 quantiles, sell bottom two quantiles.
+
+2. *han*: Same as Jega but use the momentum + volatility metric,
+
+3. *gap.n*: Find the metric and number of quantiles that creates the greatest performance separation ("gap"). Buy the top two quantiles, short the bottom two).
+
+4. *gap.q*: Same as gap.n, but buy stocks in the top two quintilies (75%+) and sell the bottom two quintiles (25%-).
+
+5. *max.s*: Look across methods and quantiles to find the maximum separation. Buy the top two quantiles. Sell the bottom two. For example, if 5 quantile momentum finds two quantiles low returns and 8 quantile momentum+volatility finds two quantiles with high returns, short the former and buy the latter. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+strat_grids=function(pnl.mstr,jega.tb.n=2,han.tb.n=2,gap.tb.n=1,gap.q.probs=0.25,gap.q.qntls=2){ 
+     # note: not breaking quantiles by quantiles. 
+     # could take top n performing splits e.g., 6, 8 and buy/sell stocks in top/bottom n portfolios.
+     
+     # jega: max quantiles, long top n, short bottom n, up to 6 lookback periods
+     row.ids=rownames(with(pnl.mstr,pnl.mstr[vrs=="momo" & 
+                                                  qntls==max(pnl.mstr$qntls) & 
+                                                  lag==min(max(pnl.mstr$lag),6),][1,8:17]))
+     
+     col.ids=as.matrix(order(pnl.mstr[row.ids,8:17],decreasing=T)[1:jega.tb.n])
+     jega=cbind("long",row.ids,col.ids)
+     
+     col.ids=as.matrix(order(pnl.mstr[row.ids,8:17],decreasing=F)[1:jega.tb.n])
+     jega=rbind(jega,cbind("short",row.ids,col.ids))
+     
+     # han: max volatility quantiles, long top n, short bottom n, up to 6 lookback periods
+     row.ids=rownames(with(pnl.mstr,pnl.mstr[vrs=="vol" & 
+                                                  qntls==max(pnl.mstr$qntls) & 
+                                                  lag==min(max(pnl.mstr$lag),6),][1,8:17]))
+     col.ids=as.matrix(order(pnl.mstr[row.ids,8:17],decreasing=T)[1:han.tb.n])
+     han=cbind("long",row.ids,col.ids)
+     
+     col.ids=as.matrix(order(pnl.mstr[row.ids,8:17],decreasing=F)[1:han.tb.n])
+     han=rbind(han,cbind("short",row.ids,col.ids));
+     
+     # biggest absolute gap
+     qnt.max=apply(pnl.mstr[,8:17], 1, function(x) max(x[!is.na(x)]))
+     qnt.min=apply(pnl.mstr[,8:17], 1, function(x) min(x[!is.na(x)]))
+     row.ids=as.numeric(which.max(qnt.max-qnt.min))
+     
+     col.ids=as.matrix(order(pnl.mstr[row.ids,8:17],decreasing=T)[1:gap.tb.n])
+     gap.n=cbind("long",row.ids,col.ids)
+     
+     col.ids=as.matrix(order(pnl.mstr[row.ids,8:17],decreasing=F)[1:gap.tb.n])
+     gap.n=rbind(gap.n,cbind("short",row.ids,col.ids))
+     
+     # biggest quantile gap (i.e., less pure, but more diversification)
+     scnd=apply(pnl.mstr[,8:17], 1, function(x) quantile(x[!is.na(x)],seq(0,1,gap.q.probs)))[2,]
+     frth=apply(pnl.mstr[,8:17], 1, function(x) quantile(x[!is.na(x)],seq(0,1,gap.q.probs)))[4,]
+     row.ids=as.numeric(which.max(frth-scnd))
+     
+     col.ids=(as.matrix(which(pnl.mstr[row.ids,8:17]>frth[row.ids])))
+     gap.q=cbind("long",row.ids,col.ids)
+     
+     col.ids=(as.matrix(which(pnl.mstr[row.ids,8:17]<scnd[row.ids])))
+     gap.q=rbind(gap.q,cbind("short",row.ids,col.ids))
+     
+     # max spread - CAN ADD CONTROLS IF THIS PROVES RELEVANT. 
+     grd.tmp=pnl.mstr[,8:17]
+     
+     bst1=which(grd.tmp==range(grd.tmp,na.rm=T)[2],arr.ind = TRUE)
+     wst1=which(grd.tmp==range(grd.tmp,na.rm=T)[1],arr.ind = TRUE)
+     
+     grd.tmp[bst1[1],bst1[2]]=NA
+     grd.tmp[wst1[1],wst1[2]]=NA
+     
+     bst2=which(grd.tmp==range(grd.tmp,na.rm=T)[2],arr.ind = TRUE)
+     wst2=which(grd.tmp==range(grd.tmp,na.rm=T)[1],arr.ind = TRUE)
+     
+     max.s=rbind(bst1,bst2,wst1,wst2)
+     max.s=cbind(c("long","long","short","short"),max.s)
+     
+     # return grids
+     grids=list(jega=jega,han=han,gap.n=gap.n,gap.q=gap.q,max.s=max.s)
+     lapply(grids,function(x) colnames(x)=c("ls","rowId","colId"))
+     return(grids)
+     
+     # capm, auto correlation, correlation: think you'd have to go back to prior function to build
+     # portfolios by capm, etc. or use these tools to anlyze ex post. 
+}
+     
+```
+
+##### strategy-lag fitting (grids)
+Once strategies are in place to evaluate the quantile portfolios, the final step is to iterate thru lags to see what combination of the three yielded the best performance in the preceeding month. The model rolls forward to the current month, builds the quantile portfolios based on the optimal lag, applies the strategies and buys and shorts stocks as appropriate. As it rolls forward, it tabules results as it closes positions at month end in preparation for a new round of trades on the first. 
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=6}
+
+ctrl_port=function(inPrcs,prt.cols,stDate,enDate,amt,cst,plot,lag=1){
+     exclude=NULL
+     perf=list()
+     prts=list()
+     ctrs=list()
+     
+     # find best model
+     toPrcs=calc_mnths(as.Date(stDate),as.Date(enDate))-1
+     for(i in 1:toPrcs){ 
+          
+          qntl.prts=list()
+          qntl.prts.ctr=1
+          p.mnths=1
+          enDate=stDate;month(enDate)=month(enDate)+p.mnths
+          p.lag=lag
+          p.hld=1
+          
+          for(j in 1:2){
+               if(j==1){p.vrs="momo"}else{p.vrs="vol"} # try both high-level strategies
+               for(l in 1:1){ #min(i,6)
+                    p.lag=l
+                    
+                    for(k in seq(3,9,2)){ # min 2, max 10
+                         p.qntls=k
+                         
+                         qntl.rslt= momo_ctrl(m=inPrcs, # in prcs
+                                    start.date=stDate,
+                                    mnths=p.mnths,
+                                    exclude=NULL,
+                                    lag=p.lag,
+                                    hold=p.hld,
+                                    qntls=p.qntls,
+                                    amt=100,
+                                    cst=0.001,
+                                    output="ports",
+                                    vrs=p.vrs,
+                                    plot="no")
+                         
+                         pnls=as.data.frame(as.Date(stDate))
+                         pnls=cbind(pnls,as.Date(enDate),p.vrs,p.mnths,p.lag,p.hld,p.qntls,
+                                   t(extend(round(as.numeric(qntl.rslt$pnls),2),10)))
+                         colnames(pnls)=c("strtDt","endDt","vrs","mnths","lag","hold","qntls",paste0("port",1:10)) 
+                         if(exists("pnl.mstr")){pnl.mstr=rbind(pnl.mstr,pnls)}else{pnl.mstr=pnls}
+                         
+                         qntl.prts[[qntl.prts.ctr]]=qntl.rslt$ports
+                         qntl.prts.ctr=qntl.prts.ctr+1
+                    }
+               }
+          }
+          per.rcds=inPrcs[paste0(stDate,"/",enDate-1)]
+          
+          if(i>1){
+               # process buy/sells, longs/shorts for each strategy 
+               
+               #rm(lng.indx,shrt.indx,lngs,shrts,lngs.mstr,shrts.mstr)
+               
+               for(g in 1:length(grids)){
+                    cur.grid=grids[[g]]
+                    
+                    if(is.null(dim(cur.grid[cur.grid[,1]=="long",c(2:3)]))){
+                         lng.rcds=1
+                         lng.indx=t(as.matrix(cur.grid[cur.grid[,1]=="long",c(2:3)]))
+                    }else{
+                         lng.indx=as.matrix(cur.grid[cur.grid[,1]=="long",c(2:3)])
+                         lng.rcds=dim(lng.indx)[1]
+                    }
+                    
+                    if(is.null(dim(cur.grid[cur.grid[,1]=="short",c(2:3)]))){
+                         shrt.rcds=1
+                         shrt.indx=t(as.matrix(cur.grid[cur.grid[,1]=="short",c(2:3)]))
+                    }else{
+                         shrt.indx=as.matrix(cur.grid[cur.grid[,1]=="short",c(2:3)])
+                         shrt.rcds=dim(shrt.indx)[1]
+                    }
+
+                    # using prior grid (strategy) find current longs
+                    for(li in 1:lng.rcds){
+                         lngs=t(as.matrix(which(qntl.prts[[as.numeric(lng.indx[li,1])]][[as.numeric(lng.indx[li,2])]][1,]>0)))
+                         if(exists("lngs.mstr")){lngs.mstr=cbind(lngs.mstr,lngs)}else{lngs.mstr=lngs}
+                    }
+                    
+                    lngs=as.vector(unique(lngs.mstr));lngs=lngs[order(lngs,decreasing=F)]
+                    lngs=lngs[lngs %in% prt.cols];rm(lngs.mstr)
+                    
+                    # find current shorts
+                    for(si in 1:shrt.rcds){
+                         shrts=t(as.matrix(which(qntl.prts[[as.numeric(shrt.indx[si,1])]][[as.numeric(shrt.indx[si,2])]][1,]>0)))
+                         if(exists("shrts.mstr")){shrts.mstr=cbind(shrts.mstr,shrts)}else{shrts.mstr=shrts}
+                    }
+                    
+                    shrts=as.vector(unique(shrts.mstr));shrts=shrts[order(shrts,decreasing=F)]
+                    shrts=shrts[shrts %in% prt.cols];rm(shrts.mstr)
+                    
+                    # execute longs / shorts
+                    if(i==2){
+                         per.inv.amt=amt*(1-cst)
+                         toSell=0 #dim(inPrcs)[2]/qntls
+                    } # kludge
+                    else{
+                         # get strategy-specific stored ledger and counters
+                         prt.lgr=prts[[g]]
+                         ctr=ctrs[[g]]
+                    
+                         # determine proceeds from sells
+                         sale.proceeds=sum(prt.lgr[ctr-1,]*as.numeric(per.rcds[dim(per.rcds)[1],]))*(1-cst)
+                         per.inv.amt=(sale.proceeds+amt)*(1-cst)
+                         toSell=sum(prt.lgr[ctr-1,]!=0)
+                    }
+                    
+                    # calc equal $ value investments
+                    lng.rcds=per.rcds[,lngs]
+                    shrt.rcds=per.rcds[,shrts]
+                    
+                    lng.inv.amt=(per.inv.amt/length(lngs))*(1-cst)
+                    shrt.inv.amt=(per.inv.amt/length(shrts))*(1-cst)
+                    
+                    lng.shares=lng.inv.amt/per.rcds[1,lngs]
+                    shrt.shares=shrt.inv.amt/per.rcds[1,shrts]
+               
+                    # update portfolio holdings
+                    if(i==2){
+                         tmpDate=stDate
+                         prt.lgr=as.xts(as.data.frame(matrix(0,1,dim(inPrcs)[2])),
+                                        order.by=seq.Date(as.Date(tmpDate),,by="month",1))
+                         colnames(prt.lgr)=names(inPrcs)
+                    
+                         toBuy=as.numeric(lng.shares)
+                         for(z in 1:length(lngs)){prt.lgr[1,lngs[z]]=toBuy[z]}
+                         toShrt=-as.numeric(shrt.shares)
+                         for(z in 1:length(shrts)){prt.lgr[1,shrts[z]]=toShrt[z]}
+                         
+                         ctr=1
+                    }else{
+                         toBuy=as.numeric(lng.shares)
+                         for(z in 1:length(lngs)){prt.lgr[ctr,lngs[z]]=toBuy[z]}
+                         toShrt=-as.numeric(shrt.shares)
+                         for(z in 1:length(shrts)){prt.lgr[1,shrts[z]]=toShrt[z]}
+                    }
+                    prts[[g]]=prt.lgr
+                    ctrs[[g]]=ctr
+                    
+                    # calc daily portfolio value
+                    for(n in 1:dim(per.rcds)[1]){
+                         holdings=prt.lgr[ctr,]
+                         eod.val=sum(as.numeric(per.rcds[n,])*holdings)
+                         if(exists("per.rtrns")){per.rtrns=rbind(per.rtrns,eod.val)}
+                         else{per.rtrns=eod.val}
+                    }
+                        
+                    # cool R re-formatting waste of time
+                    rownames(per.rtrns)=c(1:dim(per.rtrns)[1]);colnames(per.rtrns)=c("eod.vals")
+                    per.rtrns=as.data.frame(per.rtrns)
+                    per.rtrns$states=0;per.rtrns$trades=0;per.rtrns$pnl=0 #per.rtrns$cash=0;
+               
+                    # create transaction records
+                    for (q in 1:(dim(per.rtrns)[1])){
+                         if(i==2 && q==1 && !(month(stDate) %in% exclude)){
+                              per.rtrns$states[q]=0
+                              per.rtrns$trades[q]=length(toBuy)+length(toShrt)
+                              per.rtrns$pnl[q]=2*per.inv.amt-2*amt
+                         }
+                         else if(q==1 && !(month(stDate) %in% exclude)){
+                              per.rtrns$states[q]=0
+                              per.rtrns$trades[q]=length(toBuy)+length(toShrt)
+                              per.rtrns$pnl[q]=per.rtrns$eod.vals[q]
+                         }
+                         else if(q>1 && q<dim(per.rtrns)[1]){
+                              per.rtrns$states[q]=per.rtrns$states[q-1]
+                              per.rtrns$trades[q]=0
+                              per.rtrns$pnl[q]=per.rtrns$pnl[q-1]
+                         }
+                         else if(q==dim(per.rtrns)[1]){
+                              per.rtrns$states[q]=0
+                              per.rtrns$trades[q]=toSell
+                              # assuming we value pnl monthly when we make any sales
+                              per.rtrns$pnl[q]=per.rtrns$eod.vals[q]
+                         }
+                    }
+                    
+                    per.rtrns=as.xts(per.rtrns,index(per.rcds))
+                    if(i==2){perf[[g]]=per.rtrns}
+                    else{perf[[g]]=rbind(perf[[g]],per.rtrns)}
+                    rm(per.rtrns)
+                    ctr=ctr+1
+               }
+          }
+          grids=strat_grids(pnl.mstr,jega.tb.n=2,han.tb.n=2,gap.tb.n=1,gap.q.probs=0.25,gap.q.qntls=2)
+          rm(pnl.mstr)
+          month(stDate)=month(stDate)+1
+     }
+     if(plot=="yes"){plot_strat_perf(perf)}
+     names(perf)=c("jega","han","gap.n","gap.q","max.s")
+     return(perf)
+}
+
+``` 
+
+## findings
+### technical models
+Despite their long trade hold times, the base technical models performed reasonably well although with high volatility of returns. 
+
+#### moving average
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# training red
+pdt=update(index(trn.prt$red[[1]][1]),day=1)+months(1)+1
+prd.red=ctrl_tech(trn.prt$red,pdt,sp500,rf_t) # start 1 month
+
+# training blue
+pdt=update(index(trn.prt$blu[[1]][1]),day=1)+months(1)+2
+prd.blu=ctrl_tech(trn.prt$blu,pdt,sp500,rf_t) # start 1 month
+
+# training green
+pdt=update(index(trn.prt$grn[[1]][1]),day=1)+months(1)
+prd.grn=ctrl_tech(trn.prt$grn,pdt,sp500,rf_t) # start 1 month
+
+```
+
+The graphics below show the result from the "red" or "down" market test set. The first of graphics shows the states, cash and pnl series for a specific stock in the portfolio. The second graphic shows the pnl series for the whole portfolio. The portfolio was significantly positive in spite of the downturn. 
+
+*note: the volatility in these graphics is high because, unlike in later portfolio models, in these earlier iterations the model is purchasing 100 shares of stock, not $100 of stock.*
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=5,fig.width=7}
+
+mav.red=score_preds(trn.prt$red$cl,prd.red$mav,1000,100,0.001,sp500,rf_t,"all",co_plot=1)
+#mav.red$ratios$price
+#mav.red$ratios$pnl
+```
+
+Volatility of moving average returns is apparent when looking at the results in the "blue/flat" and "green/up" series. In the former, the model dialed in after the August re-fit. In the latter, the moving averge underperformed getting caught short with its long trade duration. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=4}
+
+mav.blu=score_preds(trn.prt$blu$cl,prd.blu$mav,1000,100,0.001,sp500,rf_t,"summary")
+mav.grn=score_preds(trn.prt$grn$cl,prd.grn$mav,1000,100,0.001,sp500,rf_t,"summary")
+#mav.blu$ratios$price
+#mav.blu$ratios$pnl
+```
+
+Not surprisingly, portfolio performance ratios for green reflect both the poor performance and the volatility.
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=4}
+
+mav.grn$ratios$price
+mav.grn$ratios$pnl
+
+```
+
+
+#### momentum
+In quick succession, highlights from the momentum strategy beginning with the "red/down" market performance and followed by the "blue/flat" and "green/up" market performances. *Note, however, that the strategy is doing an effective job of signalling (or at least exaggerating) changes in market direction.*
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=4}
+
+mov.red=score_preds(trn.prt$red$cl,prd.red$mov,1000,100,0.001,sp500,rf_t,"summary")
+mov.blu=score_preds(trn.prt$blu$cl,prd.blu$mov,1000,100,0.001,sp500,rf_t,"summary")
+mov.grn=score_preds(trn.prt$grn$cl,prd.grn$mov,1000,100,0.001,sp500,rf_t,"summary")
+
+```
+
+### portfolio models
+The gap.n with lag1 and the han strategy with lag5 were signficantly positive across up, down and flat markets. The table below shows aggregate scores. The heatmap highlights the fact that while lag1 works relatively well for the new indicators, han and jega gain power with the number of lags. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=3.5,fig.width=6}
+
+red.mtrx=matrix(NA,5,5);colnames(red.mtrx)=paste0("lag",1:5)
+rownames(red.mtrx)=c("jega","han","gap.n","gap.q","max.s")
+blu.mtrx=grn.mtrx=red.mtrx
+
+for(s in 1:5){
+
+     inData=trn.mkt$red$cl
+     if(isWeekday(update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date1=update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date1=update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date1,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+     
+     
+     for(q in 1:length(strat.mstr)){red.mtrx[q,s]=round(strat.mstr[[q]][dim(strat.mstr[[q]])[1],4],2)}
+
+     inData=trn.mkt$blu$cl
+     if(isWeekday(update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date2=update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date2=update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date2,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+
+     for(q in 1:length(strat.mstr)){blu.mtrx[q,s]=round(strat.mstr[[q]][dim(strat.mstr[[q]])[1],4],2)}
+
+     inData=trn.mkt$grn$cl
+     if(isWeekday(update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date3=update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date3=update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date3,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+
+     for(q in 1:length(strat.mstr)){grn.mtrx[q,s]=round(strat.mstr[[q]][dim(strat.mstr[[q]])[1],4],2)}
+}
+
+# overall gap.n winner. best at lag3. jega second. oddly shorter gap, better. 
+red.mtrx+blu.mtrx+grn.mtrx
+
+# heat map shows relative w/in ros
+heatmap(red.mtrx+blu.mtrx+grn.mtrx)
+
+```
+
+Here is a close-up of the results across market types using the han strategy. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=7}
+
+red.mtrx=matrix(NA,5,5);colnames(red.mtrx)=paste0("lag",1:5)
+rownames(red.mtrx)=c("jega","han","gap.n","gap.q","max.s")
+blu.mtrx=grn.mtrx=red.mtrx
+
+par(mfrow=c(3,1))
+    
+for(s in 5:5){
+     
+     inData=trn.mkt$red$cl
+     if(isWeekday(update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date1=update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date1=update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr.red=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date1,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+     
+     
+     for(q in 1:length(strat.mstr.red)){red.mtrx[q,s]=round(strat.mstr.red[[q]][dim(strat.mstr.red[[q]])[1],4],2)}
+     
+     # format graphics
+     grph.frm=date1+months(1)
+     grph.to=as.Date(index(inData)[length(index(inData))])-months(1)
+     y.lim=range(rbind(strat.mstr.red$han$eod.vals,
+                       mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date1+months(1)]),
+                       bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date1+months(1)])))
+     plot(mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date1+months(1)]),
+                              main="portfolio v market v buy and hold",
+                              ylim=y.lim)
+     lines(strat.mstr.red$han$eod.vals,col="blue")
+     lines(bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date1+months(1)]),col="red")
+     legend("bottomleft",legend=c("market","portfolio (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+     
+     inData=trn.mkt$blu$cl
+     if(isWeekday(update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date2=update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date2=update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr.blu=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date2,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+
+     for(q in 1:length(strat.mstr.blu)){blu.mtrx[q,s]=round(strat.mstr.blu[[q]][dim(strat.mstr.blu[[q]])[1],4],2)}
+     
+     grph.frm=date2+months(1)
+     grph.to=as.Date(index(inData)[length(index(inData))])-months(1)
+     y.lim=range(rbind(strat.mstr.blu$han$eod.vals,
+                       mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date2+months(1)]),
+                       bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date2+months(1)])))
+     plot(mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date2+months(1)]),
+                              main="portfolio v market v buy and hold",
+                              ylim=y.lim)
+     lines(strat.mstr.blu$han$eod.vals,col="blue")
+     lines(bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date2+months(1)]),col="red")
+     legend("bottomleft",legend=c("market","portfolio (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+     
+     inData=trn.mkt$grn$cl
+     if(isWeekday(update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date3=update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date3=update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr.grn=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date3,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+
+     for(q in 1:length(strat.mstr.grn)){grn.mtrx[q,s]=round(strat.mstr.grn[[q]][dim(strat.mstr.grn[[q]])[1],4],2)}
+    
+     grph.frm=date3+months(1)
+     grph.to=as.Date(index(inData)[length(index(inData))])-months(1)
+     y.lim=range(rbind(strat.mstr.grn$han$eod.vals,
+                       mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date3+months(1)]),
+                       bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date3+months(1)])))
+     plot(mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date3+months(1)]),
+                              main="portfolio v market v buy and hold",
+                              ylim=y.lim)
+     lines(strat.mstr.grn$han$eod.vals,col="blue")
+     lines(bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date3+months(1)]),col="red")
+     legend("bottomleft",legend=c("market","portfolio (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+}
+
+```
+
+### stacking inidcators
+```{r eval=FALSE,cache=FALSE,echo=FALSE,message=FALSE,results='hide',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# this section establishes train, test and validate periods based on market trend
+
+test.periods=as.data.frame(matrix(c("2007-05-02","2008-04-30","red","test",
+                                  #"2008-05-01","2009-04-30","red","train",
+                                  "2009-09-01","2010-08-31","blue","test",
+                                  #"2010-12-01","2011-11-30","blue","train",
+                                  "2012-01-03","2012-12-27","green","test"
+                                  #"2013-02-01","2014-01-31","green","train"
+                                  ),
+                                  3,4,byrow=TRUE))
+
+# ensure test period cutoffs don't fall on weekends, holidays
+for(i in 1:dim(test.periods)[1]){
+     cat(test.periods[i,1],":",weekdays(as.Date(test.periods[i,1])),"\n")
+     cat(test.periods[i,2],":",weekdays(as.Date(test.periods[i,2])),"\n")
+}
+
+# lists to hold train, test and validate data sets
+tst.prt=list("red"=list(),"blu"=list(),"grn"=list())
+tst.mkt=list("red"=list(),"blu"=list(),"grn"=list())
+
+# plot market (sp500) base data
+par(mfrow=c(1,1))
+plot(coredata(sp500$GSPC.Adjusted),type="l",main="test scenarios for sample (top) and s&p500 (bottom)",
+     col="grey",ylim=c(500,3300),xlab=paste(data.from,"to",data.to),ylab="s&p500 index")
+legend("topleft",legend=c("down market","flat market","up market"),
+       lwd=2,cex=1,col=c("red","blue","green"))
+
+bh.vals=calc_bh(data.mkt.tbls$cl,as.numeric(sp500[1,1]))
+lines(as.numeric(bh.vals),col="grey")
+
+# add lines for period classification. save data to appropriate list
+for(i in 1:dim(test.periods)[1]){
+     # plot the line
+     a=which(index(sp500)==as.Date(test.periods[i,1]))
+     b=which(index(sp500)==as.Date(test.periods[i,2]))
+     lines(a:b,coredata(sp500$GSPC.Adjusted[a:b]),col=as.character(test.periods[i,3]))
+     lines(a:b,bh.vals[a:b],col=as.character(test.periods[i,3]))
+     
+     # partion the portfolio data
+     if(test.periods[i,4]=="train"){
+          if(test.periods[i,3]=="red"){for(j in 1:5){trn.prt$red[[j]]=data.prt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="blue"){for(j in 1:5){trn.prt$blu[[j]]=data.prt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="green"){for(j in 1:5){trn.prt$grn[[j]]=data.prt.tbls[[j]][a:b]}}
+     } else if(test.periods[i,4]=="test"){
+          if(test.periods[i,3]=="red"){for(j in 1:5){tst.prt$red[[j]]=data.prt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="blue"){for(j in 1:5){tst.prt$blu[[j]]=data.prt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="green"){for(j in 1:5){tst.prt$grn[[j]]=data.prt.tbls[[j]][a:b]}}
+     }# else if(test.periods[i,4]=="val"){
+     #     if(test.periods[i,3]=="red"){for(j in 1:5){val.prt$red[[j]]=data.prt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="blue"){for(j in 1:5){val.prt$blu[[j]]=data.prt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="green"){for(j in 1:5){val.prt$grn[[j]]=data.prt.tbls[[j]][a:b]}}
+     #}
+     
+     # partion the market data
+     if(test.periods[i,4]=="train"){
+          if(test.periods[i,3]=="red"){for(j in 1:5){trn.mkt$red[[j]]=data.mkt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="blue"){for(j in 1:5){trn.mkt$blu[[j]]=data.mkt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="green"){for(j in 1:5){trn.mkt$grn[[j]]=data.mkt.tbls[[j]][a:b]}}
+     } else if(test.periods[i,4]=="test"){
+          if(test.periods[i,3]=="red"){for(j in 1:5){tst.mkt$red[[j]]=data.mkt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="blue"){for(j in 1:5){tst.mkt$blu[[j]]=data.mkt.tbls[[j]][a:b]}}
+          else if(test.periods[i,3]=="green"){for(j in 1:5){tst.mkt$grn[[j]]=data.mkt.tbls[[j]][a:b]}}
+     }# else if(test.periods[i,4]=="val"){
+     #     if(test.periods[i,3]=="red"){for(j in 1:5){val.mkt$red[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="blue"){for(j in 1:5){val.mkt$blu[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #     else if(test.periods[i,3]=="green"){for(j in 1:5){val.mkt$grn[[j]]=data.mkt.tbls[[j]][a:b]}}
+     #}
+}
+#names(trn.prt$red)=names(trn.prt$grn)=names(trn.prt$blu)=c("op","cl","hi","lo","vol")
+names(tst.prt$red)=names(tst.prt$grn)=names(tst.prt$blu)=c("op","cl","hi","lo","vol")
+#names(val.prt$red)=names(val.prt$grn)=names(val.prt$blu)=c("op","cl","hi","lo","vol")
+#names(trn.mkt$red)=names(trn.mkt$grn)=names(trn.mkt$blu)=c("op","cl","hi","lo","vol")
+names(tst.mkt$red)=names(tst.mkt$grn)=names(tst.mkt$blu)=c("op","cl","hi","lo","vol")
+#names(val.mkt$red)=names(val.mkt$grn)=names(val.mkt$blu)=c("op","cl","hi","lo","vol")
+
+```
+
+```{r eval=FALSE,cache=FALSE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=4,fig.width=6}
+
+# testing red
+if(isWeekday(update(index(tst.prt$red[[1]][1]),day=1)+months(1)+1,wday=1:5)){
+     pdt=update(index(tst.prt$red[[1]][1]),day=1)+months(1)+1
+}else{pdt=update(index(tst.prt$red[[1]][1]),day=1)+months(1)+3}
+prd.red=ctrl_tech(tst.prt$red,pdt,sp500,rf_t) # start 1 month
+
+# testing blue
+if(isWeekday(update(index(tst.prt$blu[[1]][1]),day=1)+months(1)+1,wday=1:5)){
+     pdt=update(index(tst.prt$blu[[1]][1]),day=1)+months(1)+1
+}else{pdt=update(index(tst.prt$blu[[1]][1]),day=1)+months(1)+3}
+prd.blu=ctrl_tech(tst.prt$blu,pdt,sp500,rf_t) # start 1 month
+
+# testing green
+if(isWeekday(update(index(tst.prt$grn[[1]][1]),day=1)+months(1)+1,wday=1:5)){
+     pdt=update(index(tst.prt$grn[[1]][1]),day=1)+months(1)+1
+}else{pdt=update(index(tst.prt$grn[[1]][1]),day=1)+months(1)+3}
+prd.grn=ctrl_tech(tst.prt$grn,pdt,sp500,rf_t) # start 1 month
+
+```
+
+```{r eval=FALSE,cache=FALSE,echo=FALSE,message=FALSE,results='markup',warning=FALSE,fig.show='asis',fig.height=6,fig.width=7}
+
+red.mtrx=matrix(NA,5,5);colnames(red.mtrx)=paste0("lag",1:5)
+rownames(red.mtrx)=c("jega","han","gap.n","gap.q","max.s")
+blu.mtrx=grn.mtrx=red.mtrx
+
+par(mfrow=c(3,1))
+    
+for(s in 5:5){
+     
+     inData=trn.mkt$red$cl
+     if(isWeekday(update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date1=update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date1=update(index(trn.mkt$red$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr.red=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date1,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+     
+     
+     for(q in 1:length(strat.mstr.red)){red.mtrx[q,s]=round(strat.mstr.red[[q]][dim(strat.mstr.red[[q]])[1],4],2)}
+     
+     # format graphics
+     grph.frm=date1+months(1)
+     grph.to=as.Date(index(inData)[length(index(inData))])-months(1)
+     y.lim=range(rbind(strat.mstr.red$han$eod.vals,
+                       mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date1+months(1)]),
+                       bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date1+months(1)])))
+     plot(mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date1+months(1)]),
+                              main="portfolio v market v buy and hold",
+                              ylim=y.lim)
+     lines(strat.mstr.red$han$eod.vals,col="blue")
+     lines(bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date1+months(1)]),col="red")
+     legend("bottomleft",legend=c("market","portfolio (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+     
+     inData=trn.mkt$blu$cl
+     if(isWeekday(update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date2=update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date2=update(index(trn.mkt$blu$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr.blu=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date2,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+
+     for(q in 1:length(strat.mstr.blu)){blu.mtrx[q,s]=round(strat.mstr.blu[[q]][dim(strat.mstr.blu[[q]])[1],4],2)}
+     
+     grph.frm=date2+months(1)
+     grph.to=as.Date(index(inData)[length(index(inData))])-months(1)
+     y.lim=range(rbind(strat.mstr.blu$han$eod.vals,
+                       mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date2+months(1)]),
+                       bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date2+months(1)])))
+     plot(mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date2+months(1)]),
+                              main="portfolio v market v buy and hold",
+                              ylim=y.lim)
+     lines(strat.mstr.blu$han$eod.vals,col="blue")
+     lines(bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date2+months(1)]),col="red")
+     legend("bottomleft",legend=c("market","portfolio (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+     
+     inData=trn.mkt$grn$cl
+     if(isWeekday(update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+2,wday=1:5)){
+          date3=update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+2
+     }else{date3=update(index(trn.mkt$grn$cl[1]),day=1)-months(1)+months(s)+4}
+     
+     strat.mstr.grn=ctrl_port(inData,
+                          prt.cols,
+                          stDate=date3,
+                          enDate=as.Date(index(inData)[length(index(inData))]),
+                          amt,
+                          cst,
+                          plot="no",
+                          lag=s)
+
+     for(q in 1:length(strat.mstr.grn)){grn.mtrx[q,s]=round(strat.mstr.grn[[q]][dim(strat.mstr.grn[[q]])[1],4],2)}
+    
+     grph.frm=date3+months(1)
+     grph.to=as.Date(index(inData)[length(index(inData))])-months(1)
+     y.lim=range(rbind(strat.mstr.grn$han$eod.vals,
+                       mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date3+months(1)]),
+                       bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date3+months(1)])))
+     plot(mkt.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(mkt.vals[date3+months(1)]),
+                              main="portfolio v market v buy and hold",
+                              ylim=y.lim)
+     lines(strat.mstr.grn$han$eod.vals,col="blue")
+     lines(bh.vals[paste0(grph.frm,"/",grph.to)]-as.numeric(bh.vals[date3+months(1)]),col="red")
+     legend("bottomleft",legend=c("market","portfolio (equal wt)","buy-hold (equal wt)"),
+            lwd=2,cex=1,col=c("black","blue","red"))
+     
+}
+
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=6}
+
+# does not include predictions from the portfolio model
+# does not include volatility
+# does not use svm, rf, etc.
+        
+pred=function(inXlist,inY,thr,amt.strt=1000,amt.trd=100,amt.cst=0.001,sp500,rf_t,out="summary"){
+     
+     for(z in 1:dim(inXlist[[1]])[2]){
+          
+          data=inY[,z]
+          trd.cost=abs(data)*cst
+     
+          data$dif=diff(data);data=data[-1]
+     
+          lags=as.data.frame(matrix(0,dim(data)[1],3));lag.ids=NULL
+          for(i in 1:3){
+              lag.ids[i]=sprintf("lag%i",i)
+              lags[(i+1):dim(lags)[1],i]=data[1:(dim(data)[1]-i),2]
+          }
+          lags=as.xts(lags,index(data))
+     
+          data$class=0; data$class[(data$dif-trd.cost)>0]=1
+          data=merge(data,lags)
+     
+          for(j in 1:length(inXlist)){data=merge(data,inXlist[[j]][,z],join='inner')}
+          
+          data[,7]=diff(data[,7]);data[,7][1]=0
+          data[,4:7]=scale(data[,4:7])
+          colnames(data)=c("price","difP","class",lag.ids,names(inXlist))
+     
+          data$lmRaw=data$lmScore=data$svmRaw=data$svmScore=data$rfRaw=data$rfScore=0
+     
+          for(i in 1:dim(data)[1]){
+          
+               glm.fit=glm(as.factor(data$class[1:(i-1)])~.,
+                          data=data[1:(i-1),4:9],family="binomial")
+               data$lmRaw[i]=predict(glm.fit,data[i,],type="response")
+         
+               if(i<20){incr=0.5}else{incr=thr*sd(data$lmRaw[(i-19):(i-1)])}
+               if(data$lmRaw[i]>(0.5+incr)){data$lmScore[i]=1}
+               else if(data$lmRaw[i]<(0.5-incr)){data$lmScore[i]=-1}
+               
+               if(i>20){
+                    svm.fit=svm(as.factor(data$class[1:(i-1)])~.,
+                          data=data[1:(i-1),4:9],probability=TRUE)
+                    data$svmRaw[i]=attr(predict(svm.fit,data[i,],probability=TRUE),"probabilities")[1,2]
+               
+                    if(i<20){incr=0.5}else{incr=thr*sd(data$lmRaw[(i-19):(i-1)])}
+                    if(data$svmRaw[i]>(0.5+incr)){data$svmScore[i]=1}
+                    else if(data$svmRaw[i]<(0.5-incr)){data$svmScore[i]=-1}
+               }
+               
+               #rf.fit=randomForest(as.factor(data$class[1:(i-1)])~.,
+               #           data=data[1:(i-1),4:9])
+               #data$rfRaw[i]=predict(rf.fit,data[i,],probability=TRUE)
+         
+          }
+          if(exists("lm.mstr")){lm.mstr=cbind(lm.mstr,data$lmScore)}else{lm.mstr=data$lmScore}
+          if(exists("svm.mstr")){svm.mstr=cbind(svm.mstr,data$svmScore)}else{svm.mstr=data$svmScore}
+     }
+     prd.rtrn=score_preds(inPrcMtrx=inY,
+                 inScrMtrx=lm.mstr,
+                 amt.strt=amt.strt,
+                 amt.trd=amt.trd,
+                 amt.cst=amt.cst,
+                 sp500=sp500,
+                 rf_t=rf_t,
+                 out=out)
+     
+     prd.rtrn=score_preds(inPrcMtrx=inY,
+                 inScrMtrx=svm.mstr,
+                 amt.strt=amt.strt,
+                 amt.trd=amt.trd,
+                 amt.cst=amt.cst,
+                 sp500=sp500,
+                 rf_t=rf_t,
+                 out=out)
+     
+     #return(prd.mstr)
+}
+
+
+```
+
+Finally, I combine the moving average and momentum predictions using logistic regression and support vector machines. The results suggest significant fine tuning remains. Specifically, the stacked models underperform the stand-alone models. This first set includes the "red/down" market results with logistic on left and svm on right. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=4}
+
+pred(inXlist=list(vol=trn.prt$red$vol,mov.preds=prd.red$mov,mav.preds=prd.red$mav),
+     inY=trn.prt$red$cl,
+     thr=1.4,
+     sp500=sp500,
+     rf_t=rf_t,
+     out="summary")
+
+```
+
+This second set are for the "blue/flat" market. While svm (right) avoids the logistic implosion (left), it's fitting the data like a smoothing function, without significant upside. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=4}
+
+pred(inXlist=list(vol=trn.prt$blu$vol,mov.preds=prd.blu$mov,mav.preds=prd.blu$mav),
+     inY=trn.prt$blu$cl,
+     thr=1.4,
+     sp500=sp500,
+     rf_t=rf_t,
+     out="summary")
+
+```
+
+Finally, the third set for the "green/up" market seem to point to model problems as both sets of predictors. Digging down, ti appears to be a thresholding problem. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,message=FALSE,results='asis',warning=FALSE,fig.show='hold',fig.height=4,fig.width=4}
+
+pred(inXlist=list(vol=trn.prt$grn$vol,mov.preds=prd.grn$mov,mav.preds=prd.grn$mav),
+     inY=trn.prt$grn$cl,
+     thr=1.4,
+     sp500=sp500,
+     rf_t=rf_t,
+     out="summary")
+
+```
+
+## future work
+1. Investigate the coding relative to the stacked models to see if the cause of the underperformance is due to a coding error or due to the level of abstraction from the underlying data. In particular, surfacing moving average and momentum scores directly in the variable set may lead to improvmement. Along these same lines, I need to compare the end results directly to the unconstrained moving average and momentum models (i.e., able to close trades completely at end of holding period). Finally, I need to change buying to $100 (vs. 100 shares) as a few stocks are having out-sized effect on the portfolio. 
+
+2. Expand the set of technical indicators to include RSI, etc. Also, need to expand model to select binary indicators. In particular, I need to incorporate signal coming from the porfolio model and add in cointegration signal.
+
+3. After tuning the models on the training set, I need to run them against an independent test set. I had identified three additional 1 year "up", "down" and "flat" markets, but was unable to run validation against them given the time constraint. 
